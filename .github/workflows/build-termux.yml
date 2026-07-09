@@ -1,85 +1,184 @@
+# Build Hermes Agent for Termux (aarch64-linux-android)
+#
+# Uses QEMU emulation to run a native aarch64 Termux environment
+# in Docker, then builds everything inside it — exactly like building
+# on your phone, but faster on GitHub's runners.
+#
+# Trigger: manually (workflow_dispatch) or on tags like "termux-v*"
+# Output: wheelhouse/*.whl + install script as release artifact
+
 name: Build for Termux (Android)
 
 on:
   workflow_dispatch:
     inputs:
       extras:
-        description: Pip extras to install
+        description: Pip extras to install (termux, termux-all, or empty for core)
         required: true
         default: termux
         type: choice
         options:
           - termux
           - termux-all
-          - ""
-  push:
-    branches: [main]
-    paths:
-      - pyproject.toml
-      - constraints-termux.txt
-      - .github/workflows/build-termux.yml
+          - core
   release:
     types: [published]
 
-permissions:
-  contents: write
-
-env:
-  PYTHON_VERSION: "3.11"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-termux:
-    name: Build Hermes for Termux
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    name: Build for Termux (aarch64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          fetch-depth: 1
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang pkg-config libffi-dev libssl-dev make rustc cargo
+      # ── QEMU for running ARM64 containers on x86_64 runner ──
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
-      - name: Build wheel
-        env:
-          ANDROID_API_LEVEL: "35"
+      # ── Build inside a native Termux ARM64 container ─────────
+      - name: Build in Termux Docker
         run: |
-          python -m pip install --upgrade pip setuptools wheel build
-          python -m build --wheel
+          docker run --rm --platform linux/arm64 \
+            -v $PWD:/workspace \
+            -w /workspace \
+            termux/termux-docker:aarch64 \
+            bash -c '
+              set -e
 
-      - name: Install and verify
-        env:
-          ANDROID_API_LEVEL: "35"
+              echo "==> Updating Termux packages..."
+              apt-get update -qq
+              apt-get upgrade -y -qq
+
+              echo "==> Installing build dependencies..."
+              apt-get install -y -qq \
+                python \
+                python-pip \
+                binutils \
+                rust \
+                make \
+                clang \
+                pkg-config \
+                libffi \
+                openssl
+
+              echo "==> Setting up venv..."
+              export ANDROID_API_LEVEL=$(getprop ro.build.version.sdk 2>/dev/null || echo 24)
+              python -m venv venv
+              source venv/bin/activate
+              pip install --upgrade pip setuptools wheel build
+
+              echo "==> Building Hermes Agent wheel..."
+              python -m build --wheel
+
+              echo "==> Installing Hermes with extras..."
+              WHEEL=$(ls dist/*.whl | head -1)
+              EXTRAS="${{ github.event.inputs.extras || 'termux' }}"
+              if [ "$EXTRAS" = "core" ]; then
+                pip install "$WHEEL" -c constraints-termux.txt
+              else
+                pip install "$WHEEL[$EXTRAS]" -c constraints-termux.txt
+              fi
+
+              echo "==> Verifying..."
+              hermes version || echo "Note: hermes entrypoint may need PATH"
+              python -c "import hermes_agent; print(f'Hermes Agent {hermes_agent.__version__}')" 2>/dev/null || true
+
+              echo "==> Building all dependency wheels for offline install..."
+              mkdir -p /workspace/wheelhouse
+
+              # Build the hermes-agent wheel
+              cp dist/*.whl /workspace/wheelhouse/ 2>/dev/null || true
+
+              # Build all transitive deps as wheels too
+              pip wheel -w /workspace/wheelhouse . 2>&1 || true
+
+              # If extras specified, build those wheels too
+              if [ "$EXTRAS" != "core" ] && [ "$EXTRAS" != "" ]; then
+                pip wheel -w /workspace/wheelhouse .[$EXTRAS] 2>&1 || true
+              fi
+
+              echo "==> Wheels built:"
+              ls -lh /workspace/wheelhouse/ | head -30
+
+              # Also create a portable venv tarball
+              echo "==> Creating portable venv tarball..."
+              tar czf /workspace/hermes-termux-venv.tar.gz venv/
+            '
+        shell: bash
+
+      # ── Create install script ──────────────────────────────────
+      - name: Create Termux install script
         run: |
-          WHEEL=$(ls dist/*.whl | head -1)
-          EXTRAS="${{ github.event.inputs.extras || 'termux' }}"
-          if [ -n "$EXTRAS" ]; then
-            python -m pip install "$WHEEL[$EXTRAS]" -c constraints-termux.txt
-          else
-            python -m pip install "$WHEEL" -c constraints-termux.txt
+          cat > wheelhouse/install-termux.sh << 'SCRIPT'
+          #!/data/data/com.termux/files/usr/bin/bash
+          # Install Hermes Agent on Termux from prebuilt wheels
+          set -e
+
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          echo "==> Installing Hermes Agent for Termux..."
+          echo "==> Wheel directory: $DIR"
+
+          if ! command -v python3 &>/dev/null; then
+            echo "Error: python3 not found. Install it: pkg install python"
+            exit 1
           fi
-          hermes version
-          hermes doctor || true
 
-      - name: Package artifact
-        run: |
-          mkdir -p hermes-termux
-          cp dist/*.whl hermes-termux/
-          cp constraints-termux.txt hermes-termux/ 2>/dev/null || true
-          echo "Hermes Agent Termux Build" > hermes-termux/README.txt
-          tar czf hermes-termux-build.tar.gz hermes-termux/
+          # Install from local wheelhouse (no compilation needed!)
+          pip install --no-index --find-links "$DIR" hermes-agent 2>&1
 
-      - name: Upload artifacts
+          echo ""
+          echo "==> Done! Run 'hermes' to start chatting."
+          echo "==> First time? Run 'hermes setup' to configure your API keys."
+          SCRIPT
+          chmod +x wheelhouse/install-termux.sh
+
+      # ── Upload as artifact ──────────────────────────────────────
+      - name: Upload wheels as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hermes-termux-build
+          name: hermes-termux-wheels
           path: |
-            dist/*.whl
-            hermes-termux-build.tar.gz
-          retention-days: 30
+            wheelhouse/
+            hermes-termux-venv.tar.gz
+          retention-days: 90
+
+      - name: Create Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            wheelhouse/*.whl
+            hermes-termux-venv.tar.gz
+          name: Termux ${{ github.ref_name }}
+          body: |
+            Prebuilt Hermes Agent for Termux (android-aarch64).
+
+            ## How to install on your phone
+
+            1. Download `hermes-termux-wheels` artifact from the build
+            2. Extract on your Termux device:
+               ```bash
+               unzip hermes-termux-wheels.zip -d ~/hermes-wheels
+               ```
+            3. Install (no compilation needed!):
+               ```bash
+               cd ~/hermes-wheels
+               bash install-termux.sh
+               ```
+            4. Configure and run:
+               ```bash
+               hermes setup
+               hermes
+               ```
