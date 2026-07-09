@@ -4,65 +4,56 @@ on:
   workflow_dispatch:
     inputs:
       extras:
-        description: 'Pip extras to install (e.g., termux, termux-all)'
+        description: Pip extras to install
         required: true
-        default: 'termux'
+        default: termux
         type: choice
         options:
           - termux
           - termux-all
-          - ''
+          - ""
   push:
     branches: [main]
     paths:
-      - 'pyproject.toml'
-      - 'constraints-termux.txt'
-      - '.github/workflows/build-termux.yml'
+      - pyproject.toml
+      - constraints-termux.txt
+      - .github/workflows/build-termux.yml
   release:
     types: [published]
 
 permissions:
   contents: write
-  packages: write
 
 env:
   PYTHON_VERSION: "3.11"
 
 jobs:
   build-termux:
-    name: Build Hermes for Termux (aarch64)
-    runs-on: ubuntu-24.04-arm  # Native ARM runner — no QEMU needed
+    name: Build Hermes for Termux
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install system dependencies (Termux-compatible)
+      - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            clang \
-            pkg-config \
-            libffi-dev \
-            libssl-dev \
-            make \
-            rustc \
-            cargo
+          sudo apt-get install -y -qq clang pkg-config libffi-dev libssl-dev make rustc cargo
 
-      - name: Build Python wheel
+      - name: Build wheel
         env:
           ANDROID_API_LEVEL: "35"
         run: |
           python -m pip install --upgrade pip setuptools wheel build
           python -m build --wheel
 
-      - name: Install Hermes (Termux extras)
+      - name: Install and verify
         env:
           ANDROID_API_LEVEL: "35"
         run: |
@@ -73,67 +64,22 @@ jobs:
           else
             python -m pip install "$WHEEL" -c constraints-termux.txt
           fi
-
-      - name: Verify installation
-        run: |
           hermes version
           hermes doctor || true
 
-      - name: Create portable tarball
+      - name: Package artifact
         run: |
-          # Package the venv + constraints for easy deployment
-          VENV_PATH=$(dirname $(which python))
-          HERMES_HOME="${{ runner.temp }}/hermes-portable"
-          mkdir -p "$HERMES_HOME"
+          mkdir -p hermes-termux
+          cp dist/*.whl hermes-termux/
+          cp constraints-termux.txt hermes-termux/ 2>/dev/null || true
+          echo "Hermes Agent Termux Build" > hermes-termux/README.txt
+          tar czf hermes-termux-build.tar.gz hermes-termux/
 
-          # Copy the hermes binary and deps
-          cp $(which hermes) "$HERMES_HOME/" 2>/dev/null || true
-
-          # Find and copy the installed hermes-agent package
-          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          rsync -a "$SITE_PACKAGES/hermes_agent" "$HERMES_HOME/" 2>/dev/null || cp -r "$SITE_PACKAGES/hermes_agent" "$HERMES_HOME/" 2>/dev/null || true
-
-          # Also copy constraints-termux.txt for reference
-          cp constraints-termux.txt "$HERMES_HOME/" 2>/dev/null || true
-
-          # Create a README
-          cat > "$HERMES_HOME/README.md" << 'EOF'
-        # Hermes Agent — Termux Build
-
-        Built on GitHub Actions for Android/Termux (aarch64).
-
-        ## Deploy on your phone
-        ```bash
-        # On your phone (Termux):
-        pkg install python clang rust make pkg-config libffi openssl
-        python -m venv venv
-        source venv/bin/activate
-        export ANDROID_API_LEVEL=$(getprop ro.build.version.sdk)
-        pip install hermes_agent*.whl
-        hermes version
-        ```
-        EOF
-
-          # Package the wheel too
-          cp dist/*.whl "$HERMES_HOME/" 2>/dev/null || true
-
-          # Create tarball
-          cd "${{ runner.temp }}"
-          tar czf hermes-portable-termux.tar.gz hermes-portable/
-
-      - name: Upload build artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: hermes-termux-build
           path: |
             dist/*.whl
-            ${{ runner.temp }}/hermes-portable-termux.tar.gz
+            hermes-termux-build.tar.gz
           retention-days: 30
-
-      - name: Create Release (on tag push)
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.whl
-            ${{ runner.temp }}/hermes-portable-termux.tar.gz
