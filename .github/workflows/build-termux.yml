@@ -1,124 +1,40 @@
-# Build Hermes Agent for Termux (aarch64-linux-android)
-#
-# Uses QEMU to run a native Termux container, builds everything inside it.
-# No cross-compilation headaches — exactly like building on your phone.
-
-name: Build for Termux (Android)
+name: Build Hermes Wheel
 
 on:
   workflow_dispatch:
-    inputs:
-      extras:
-        description: Pip extras to install
-        required: true
-        default: termux
-        type: choice
-        options:
-          - termux
-          - termux-all
-          - core
-  release:
-    types: [published]
+  push:
+    tags:
+      - 'v*'
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: write
 
 jobs:
-  build-termux:
-    name: Build for Termux (aarch64)
+  build-wheel:
+    name: Build Python wheel
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    permissions:
-      contents: write
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
-          platforms: arm64
+          python-version: "3.11"
 
-      - name: Build in Termux Docker
-        shell: bash
+      - name: Build wheel
         run: |
-          DOCKER_CMD=$(cat << 'DOCKERCMD'
-            set -e
-            echo "==> Updating Termux packages..."
-            apt-get update -qq
-            apt-get upgrade -y -qq
+          pip install build
+          python -m build --wheel
 
-            echo "==> Installing build dependencies..."
-            apt-get install -y -qq python python-pip binutils rust make clang pkg-config libffi openssl
-
-            echo "==> Copy source to /tmp (avoid mount permission issues)..."
-            cp -a /workspace /tmp/build
-            cd /tmp/build
-
-            echo "==> Setting up venv and building..."
-            export ANDROID_API_LEVEL=24
-            python -m venv venv
-            source venv/bin/activate
-            pip install --upgrade pip setuptools wheel build
-
-            echo "==> Building Hermes wheel..."
-            python -m build --wheel
-
-            echo "==> Installing Hermes..."
-            WHEEL=$(ls dist/*.whl | head -1)
-            EXTRAS="${{ github.event.inputs.extras || 'termux' }}"
-            if [ "$EXTRAS" = "core" ]; then
-              pip install "$WHEEL" -c constraints-termux.txt
-            else
-              pip install "$WHEEL[$EXTRAS]" -c constraints-termux.txt
-            fi
-
-            echo "==> Building all dependency wheels..."
-            mkdir -p /workspace/wheelhouse
-            cp dist/*.whl /workspace/wheelhouse/ 2>/dev/null || true
-            pip wheel -w /workspace/wheelhouse . 2>&1 || true
-            if [ "$EXTRAS" != "core" ] && [ "$EXTRAS" != "" ]; then
-              pip wheel -w /workspace/wheelhouse .[$EXTRAS] 2>&1 || true
-            fi
-
-            echo "==> Creating portable venv tarball..."
-            tar czf /workspace/hermes-termux-venv.tar.gz -C /tmp/build venv/
-
-            echo "==> Done! Wheels:"
-            ls -lh /workspace/wheelhouse/
-          DOCKERCMD
-          )
-
-          docker run --rm --platform linux/arm64             -v $PWD:/workspace             termux/termux-docker:aarch64             bash -c "$DOCKER_CMD"
-
-      - name: Create install script
-        run: |
-          mkdir -p wheelhouse
-          cat > wheelhouse/install-termux.sh << 'SCRIPT'
-          #!/data/data/com.termux/files/usr/bin/bash
-          set -e
-          DIR="$(cd "$(dirname "$0")" && pwd)"
-          echo "==> Installing Hermes Agent for Termux from prebuilt wheels..."
-          pip install --no-index --find-links "$DIR" hermes-agent 2>&1
-          echo ""
-          echo "==> Done! Run: hermes setup   then   hermes"
-          SCRIPT
-          chmod +x wheelhouse/install-termux.sh
-
-      - name: Upload wheels as artifact
+      - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: hermes-termux-wheels
-          path: |
-            wheelhouse/
-            hermes-termux-venv.tar.gz
+          name: hermes-wheel
+          path: dist/*.whl
           retention-days: 90
 
       - name: Create Release
-        if: github.event_name == 'release'
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            wheelhouse/*.whl
-            hermes-termux-venv.tar.gz
+          files: dist/*.whl
